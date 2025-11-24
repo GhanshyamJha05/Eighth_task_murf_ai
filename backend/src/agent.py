@@ -20,8 +20,9 @@ from livekit.agents import (
     function_tool,
     RunContext
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+import murf_tts
 
 logger = logging.getLogger("agent")
 
@@ -47,24 +48,30 @@ current_room = None
 class GreeterAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a friendly tutor greeter. Your job is to welcome students and help them choose a learning mode.
+            instructions="""You are a friendly programming tutor. Your job is to help students learn programming concepts through three different modes.
             
-            You have three learning modes available:
-            1. LEARN mode - Where I explain programming concepts to you
-            2. QUIZ mode - Where I ask you questions to test your knowledge
-            3. TEACH BACK mode - Where you explain concepts back to me
+            IMPORTANT: Check the current_mode to know which mode you're in:
+            - If current_mode is None: You're in greeter mode - welcome the student and explain the three modes
+            - If current_mode is 'learn': Explain programming concepts clearly with examples
+            - If current_mode is 'quiz': Ask questions to test their knowledge
+            - If current_mode is 'teach_back': Ask them to explain concepts and give feedback
+            
+            Three learning modes:
+            1. LEARN mode - You explain programming concepts with examples and analogies
+            2. QUIZ mode - You ask questions to test their knowledge
+            3. TEACH BACK mode - They explain concepts to you and you give feedback
             
             Available concepts:
-            - Variables
-            - Loops
-            - Functions
-            - Conditional Statements
-            - Arrays and Lists
+            - Variables: Containers that store values
+            - Loops: Repeat actions multiple times (for loops, while loops)
+            - Functions: Reusable blocks of code
+            - Conditional Statements: Make decisions (if/else)
+            - Arrays and Lists: Collections of multiple values
             
-            Ask the user which mode they'd like to start with, or if they want to hear more about each mode.
-            Once they choose, use the switch_mode tool to connect them to the appropriate learning agent.
+            When greeting: Ask which mode they'd like and use the switch_mode tool.
+            When in a mode: Behave according to that mode's purpose.
             
-            Keep your responses friendly, encouraging, and concise.""",
+            Keep responses friendly, encouraging, and concise.""",
         )
     
     @function_tool
@@ -83,23 +90,38 @@ class GreeterAgent(Agent):
         current_mode = mode
         logger.info(f"Switching to mode: {mode}")
         
-        # Trigger agent handoff
+        # Return confirmation message
         if mode == 'learn':
-            await context.start_agent(LearnAgent())
-            return "Switching you to Learn mode with Matthew..."
+            return "Great! I'm now in Learn mode. I'll explain programming concepts to you. What would you like to learn about? We have: variables, loops, functions, conditional statements, and arrays."
         elif mode == 'quiz':
-            await context.start_agent(QuizAgent())
-            return "Switching you to Quiz mode with Alicia..."
+            return "Awesome! I'm now in Quiz mode. I'll ask you questions to test your knowledge. Which topic would you like to be quizzed on? Variables, loops, functions, conditionals, or arrays?"
         else:  # teach_back
-            await context.start_agent(TeachBackAgent())
-            return "Switching you to Teach Back mode with Ken..."
+            return "Perfect! I'm now in Teach Back mode. You'll explain concepts to me. Which concept would you like to teach me about? Choose from: variables, loops, functions, conditionals, or arrays."
+    
+    @function_tool
+    async def get_concept(self, context: RunContext, concept_id: Annotated[str, "The concept ID: 'variables', 'loops', 'functions', 'conditionals', or 'arrays'"]):
+        """Get information about a programming concept.
+        
+        Args:
+            concept_id: The ID of the concept to retrieve
+        """
+        global current_concept
+        
+        concept = next((c for c in tutor_content if c['id'] == concept_id.lower()), None)
+        if not concept:
+            return f"I don't have information about '{concept_id}'. Available concepts are: variables, loops, functions, conditionals, and arrays."
+        
+        current_concept = concept
+        logger.info(f"Retrieved concept: {concept['title']}")
+        
+        return f"Concept: {concept['title']}\n\nSummary: {concept['summary']}\n\nSample Question: {concept['sample_question']}"
 
 
 # Learn Mode Agent - Explains concepts (Voice: Matthew)
 class LearnAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are Matthew, a patient and clear programming tutor in LEARN mode.
+            instructions="""You are Ryan, a patient and clear programming tutor in LEARN mode.
             
             Your role is to explain programming concepts from the content file in a clear, beginner-friendly way.
             Use analogies and examples to make concepts easy to understand.
@@ -299,32 +321,53 @@ async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
+    
+    # Log the agent name if provided
+    if hasattr(ctx, 'agent_name') and ctx.agent_name:
+        logger.info(f"Agent name provided: {ctx.agent_name}")
+    else:
+        logger.info("No agent name provided")
+        
+    # Log when we receive a job
+    logger.info(f"Received job for room: {ctx.room.name}")
+    logger.info(f"Job context: {ctx}")
+    
+    # Log when we start processing
+    logger.info("Starting to process job...")
 
     # Create session factory that can be reused for different agents
     def create_session(agent_type: str):
-        # Choose voice based on agent type
+        # Choose voice based on agent type - Using Murf Falcon voices
         voice_map = {
-            'greeter': 'en-US-matthew',  # Greeter uses Matthew
-            'learn': 'en-US-matthew',     # Learn mode uses Matthew
-            'quiz': 'en-US-alicia',       # Quiz mode uses Alicia
-            'teach_back': 'en-US-ken'     # Teach back mode uses Ken
+            'greeter': 'en-US-ryan',         # Greeter uses Ryan (male, young adult)
+            'learn': 'en-US-ryan',           # Learn mode uses Ryan
+            'quiz': 'en-US-alicia',          # Quiz mode uses Alicia (female, young adult)
+            'teach_back': 'en-US-ken'        # Teach back mode uses Ken (male, middle-aged)
         }
         
-        voice = voice_map.get(agent_type, 'en-US-matthew')
-        logger.info(f"Creating session for {agent_type} with voice {voice}")
+        voice = voice_map.get(agent_type, 'en-US-ryan')
+        logger.info(f"Creating session for {agent_type} with Murf voice {voice}")
         
         return AgentSession(
-            stt=deepgram.STT(model="nova-3"),
-            llm=google.LLM(model="gemini-2.5-flash"),
-            tts=murf.TTS(
+            stt=deepgram.STT(
+                model="nova-3",
+                language="en-US",
+                interim_results=True,
+            ),
+            llm=google.LLM(
+                model="gemini-2.5-flash",
+                temperature=0.7,
+            ),
+            tts=murf_tts.TTS(
                 voice=voice,
-                style="Conversation",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
+                style="Conversational",
+                tokenizer=tokenize.basic.SentenceTokenizer(
+                    min_sentence_len=10,
+                ),
             ),
             turn_detection=MultilingualModel(),
             vad=ctx.proc.userdata["vad"],
-            preemptive_generation=True,
+            preemptive_generation=False,  # Disable to reduce stuttering
         )
 
     # Start with Greeter agent (Matthew voice)
